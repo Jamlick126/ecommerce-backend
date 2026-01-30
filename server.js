@@ -263,12 +263,23 @@ app.post('/api/stkpush', async (req, res) => {
             "PartyA": phone, // e.g., 254712345678
             "PartyB": shortcode,
             "PhoneNumber": phone,
-            "CallBackURL": "https://yourdomain.com/api/callback",
+            "CallBackURL": "https://unreleasing-ascogenous-bev.ngrok-free.dev/api/callback",
             "AccountReference": "RedStore",
             "TransactionDesc": "Payment for goods"
         }, {
             headers: { Authorization: `Bearer ${token}` }
         });
+
+        if (response.data.ResonseCode === "0") {
+            const { username } = req.body;
+            const checkoutID = response.data.CheckoutRequestID;
+
+            await pool.query(
+                "INSERT INTO orders (username, checkout_request_id, amount, status) VALUES ($1, $2, $3, $4)",
+                [username, checkoutID, amount, 'pending']
+            );
+        }
+
         res.status(200).json(response.data);
     } catch (err) {
         res.status(500).json(err.message);
@@ -280,18 +291,37 @@ app.post('/api/stkpush', async (req, res) => {
 app.post('/api/callback', async (req, res) => {
     const callbackData = req.body.Body.stkCallback;
     const resultCode = callbackData.ResultCode;
-    const checkoutRequestID = callbackData.CheckoutRequestID;
+    const checkoutID = callbackData.CheckoutRequestID;
 
     if (resultCode === 0) {
         // resultcode 0 means success!
         const amount = callbackData.CallbackMetadata.Item[0].Value;
         const mpesaReceipt = callbackData.CallbackMetadata.Item[1].Value;
-        const phoneNumber = callbackData.CallbackMetadata.Item[4].Value;
+        
+        try {
+            const orderRes = await pool.query("SELECT username FROM orders WHERE checkout_request_id = $1", [checkoutID]);
 
-        console.log(`Payment Successful! Receipt: ${mpesaReceipt}, Amount: ${amount}`);
-        // TODO: Update order status in DB, send confirmation etc.
+            if (orderRes.rows.length > 0) {
+                const username = orderRes.rows[0].username;
+
+                // update order status
+                await pool.query(
+                    "UPDATE orders SET status = 'paid', mpesa_receipt = $1 WHERE checkout_request_id = $2",
+                    [mpesaReceipt, checkoutID]
+                );
+                // clear user's cart
+                await pool.query(
+                    "DELETE FROM cart WHERE user_id = (SELECT id FROM users WHERE username = $1)",
+                    [username]
+                );
+                console.log(`Cart cleared and order marked as paid for ${username}`);
+            }
+        } catch (dbErr) {
+            console.error("Database Update Error:", dbErr.message);
+        }
     } else {
-        console.log(`Payment failed or cancelled. Code: ${resultCode}`);
+        console.log(`Payment failed for Request: ${checkoutID}. Code: ${resultCode}`);
+        await pool.query("UPDATE orders SET status = 'failed' WHERE checkout_request_id = $1", [checkoutID]);
     }
     res.status(200).send("Success");
 })
