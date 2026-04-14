@@ -30,9 +30,12 @@ const verifyToken = ( req, res, next) => {
     }
 };
 
-//PostgeSQL Connection
+//Supabase Connection
 const pool = new Pool ({
     connectionString: process.env.DATABASE_URL,
+    ssl: {
+        rejectUnauthorized: false
+    }
 });
 
 // Helper to get M-pesa Token
@@ -270,7 +273,7 @@ app.post('/api/stkpush', async (req, res) => {
             headers: { Authorization: `Bearer ${token}` }
         });
 
-        if (response.data.ResonseCode === "0") {
+        if (response.data.ResponseCode === "0") {
             const { username } = req.body;
             const checkoutID = response.data.CheckoutRequestID;
 
@@ -325,6 +328,32 @@ app.post('/api/callback', async (req, res) => {
     }
     res.status(200).send("Success");
 })
+
+app.post('/api/intasend-webhook', async (req, res) => {
+    const { invoice_id, state, api_ref } = req.body;
+
+    // 'state' will be 'COMPLETE' for successful payments
+    if (state === 'COMPLETE') {
+        try {
+            // Use api_ref or other metadata to identify the user
+            // Example: Update your DB to mark order as paid
+            await pool.query(
+                "UPDATE orders SET status = 'paid' WHERE invoice_id = $1",
+                [invoice_id]
+            );
+            if (api_ref) {
+                await pool.query(
+                    "DELETE FROM cart WHERE user_id = (SELECT id FROM users WHERE username = $1)",
+                    [api_ref]
+                );
+                console.log(`IntaSend Success: Cart cleared for user ${api_ref}`);
+            }
+        } catch (err) {
+            console.error("Webhook DB Error:", err.message);
+        }
+    }
+    res.sendStatus(200); // Always tell IntaSend you received the message
+});
 
 
 app.listen(PORT, () => {
