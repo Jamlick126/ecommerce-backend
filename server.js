@@ -2,13 +2,15 @@ const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
-const { Pool } = require('pg');
+const axios = require('axios');
+const { createClient} = require('@supabase/supabase-js');
+const WebSocket = require('ws');
 require('dotenv').config();
 
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-const axios = require('axios');
+
 
 // Middleware
 app.use(cors());
@@ -30,13 +32,34 @@ const verifyToken = ( req, res, next) => {
     }
 };
 
-//Supabase Connection
-const pool = new Pool ({
-    connectionString: process.env.DATABASE_URL,
-    ssl: {
-        rejectUnauthorized: false
-    }
+// 1. Supabase CLient(Connects to your central registry database containing customer connection strings)
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
+    auth: { persistSession: false },
+    realtime: { transport: WebSocket } // Disables WebSocket requirements for Node 20
 });
+
+// 2. Tenant Middleware: Attaches the correct DB pool based on header
+const tenantDbMiddleware = async (req, res, next) => {
+    const storeSlug = req.headers['x-store-slug'] || req.query.store_slug || 'default-store';
+    try {
+        // Verify store ecosystem exists in master_stores
+        const { data, error } = await supabase
+            .from('master_stores')
+            .select('store_slug')
+            .eq('store_slug', storeSlug)
+            .single();
+
+        if (error || !data) {
+            return res.status(404).json({ message: "Store ecosystem not found" });
+        }
+
+        req.storeSlug = storeSlug;
+        next();
+    } catch (err) {
+        console.error("Tenant DB Middleware Error:", err.message);
+        res.status(500).json({ message: "Server Error" });
+    }
+};
 
 // Helper to get M-pesa Token
 const getMpesaToken = async (next) => {
@@ -57,199 +80,289 @@ const getMpesaToken = async (next) => {
     }
 };
 
-// Test Database Connection
-pool.connect((err) => {
-    if(err) {
-        console.error('Database connection error:', err);
-    } else {
-        console.log('Connected to the database')
+
+// 3. Public route to fetch store branding/config from Master DB
+app.get('/api/store-config/:slug', async (req, res) => {
+    try {
+        const { slug } = req.params;
+        const { data, error } = await supabase
+            .from('master_stores')
+            .select('*')
+            .eq('store_slug', slug)
+            .single();
+        if (error || !data) {
+            return res.status(404).json({ message: "Store not found" });
+        }
+        res.json(data);
+    } catch (err) {
+        console.error("Store Config Error:", err.message);
+        res.status(500).send('Server Error');
     }
 });
 
-// Route to GET all products
-app.get('/api/products', async (req, res) => {
+// 4. Protected/Tenant-specific routes use tenantDbMiddleware
+app.get('/api/products', tenantDbMiddleware, async (req, res) => {
     try {
-        const result = await pool.query("SELECT * FROM products");
-        res.json(result.rows)
+        // Fetch products using Supabase client over HTTPS
+        const { data, error } = await supabase
+            .from('products')
+            .select('*');
+
+        if (error) {
+            console.error("Supabase Error:", error);
+            return res.status(500).json({ message: error.message });
+        }
+
+        res.json(data);
     } catch (err) {
-        console.error(err.message);
+        console.error("Products Route Error:", err.message);
         res.status(500).send('Server Error');
     }
 });
 
 // Route to GET single products
-app.get('/api/products/:id', async (req, res) => {
+app.get('/api/products/:id', tenantDbMiddleware, async (req, res) => {
     try {
         const { id } = req.params;
-        const product = await pool.query("SELECT * FROM products WHERE id = $1", [id]);
+        const { data: product, error } = await supabase
+            .from('products')
+            .select('*')
+            .eq('id', id)
+            .single();
 
-        if (product.rows.length === 0) {
-            return res.status(404).json({ message: "Product not found"});
+        if (error || !product) {
+            return res.status(404).json({ message: "Product not found" });
         }
-        res.json(product.rows[0]);
+        res.json(product);
     } catch (err) {
-        console.error(err.message);
+        console.error("Products Route Error:", err.message);
         res.status(500).send("Server Error");
     }
 });
 
 // Route: POST register a new user
-app.post('/api/register', async (req, res) => {
+app.post('/api/register', tenantDbMiddleware, async (req, res) => {
     try {
         const { username, email, password } = req.body;
-
         // Hash password 
         const saltRounds = 10;
         const hashedPassword = await bcrypt.hash(password, saltRounds);
 
         // Insert into PostgreSQL
-        const newUser = await pool.query(
-            "INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3) RETURNING *",
-            [username, email, hashedPassword]
-        );
-        res.json({message: "User registered successfully!", user: newUser.rows[0]});
+        const { data, error } = await supabase
+            .from('users')
+            .insert([{ username, email, password_hash: hashedPassword }])
+            .select()
+            .single();
+
+        if (error) {
+            return res.status(500).json({ message: error.message || "Registration failed. Email or Username already exists." });
+        }
+
+        res.json({ message: "User registered successfully!", user: data });
     } catch (err) {
-        console.error(err.message);
-        res.status(500).json("Registration failed. Email or Username already exists.");
+        console.error("Registration Error:", err.message);
+        res.status(500).json({ message: "Server Error" });
     }
 });
 
 // Route POST login
-app.post('/api/login', async (req, res) => {
+app.post('/api/login',tenantDbMiddleware, async (req, res) => {
     try {
         const { email, password } = req.body;
         // Look for user in the database
-        const user = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
+       
+        const { data: user, error } = await supabase
+            .from('users')
+            .select('*')
+            .eq('email', email)
+            .single();
 
-        if (user.rows.length === 0) {
-            return res.status(401).json({message: "Invalid Email or Password" });
+        if (error || !user) {
+            return res.status(401).json({ message: "Invalid Email or Password" });
         }
         
-        const validPassword = await bcrypt.compare(password, user.rows[0].password_hash);
+        const validPassword = await bcrypt.compare(password, user.password_hash);
         // Check if the password matches replace with bcrypt
         if (validPassword) {
             // Generate a JWT Token
             const token = jwt.sign(
-                { id: user.rows[0].id, email: user.rows[0].email},
+                { id: user.id, email: user.email},
                 process.env.JWT_SECRET || "My_secret_key",
                 { expiresIn: '1h' }
             )
             res.json({
                 message: "Login Successful!",
                 token: token,
-                user: { username: user.rows[0].username, email: user.rows[0].email }
+                user: { username: user.username, email: user.email }
             })
         } else {
             res.status(401).json({ message: "Invalid Email or Password"});
         }
     } catch (err) {
-        console.error(err.message);
+        console.error("Login Error:", err.message);
         res.status(500).json({message: "Server Error"});
     }
 });
 
 // Route to POST items to the cart
-app.post('/api/cart', async (req, res) => {
+app.post('/api/cart',tenantDbMiddleware, async (req, res) => {
     try {
         const { username, productId, quantity } = req.body;
 
         // get user ID from username
-        const userRes = await pool.query("SELECT id FROM users WHERE username = $1", [username]);
-        if (userRes.rows.length === 0) return res.status(404).json("User not found");
+        const { data: user, error: userError } = await supabase
+            .from('users')
+            .select('id')
+            .eq('username', username)
+            .single();
 
-        const userId = userRes.rows[0].id;
+        if (userError || !user) return res.status(404).json({ message: "User not found" });
 
-        const result = await pool.query(
-            `INSERT INTO cart (user_id, product_id, quantity) 
-             VALUES($1, $2, $3) 
-             ON CONFLICT (user_id, product_id) 
-             DO UPDATE SET quantity = cart.quantity + $3 RETURNING *`,
-            [userId, productId, quantity]
-        );
-        res.status(201).json(result.rows[0]);   
+        // Upsert cart item
+        const { data, error } = await supabase
+            .from('cart')
+            .upsert(
+                { user_id: user.id, product_id: productId, quantity },
+                { onConflict: 'user_id, product_id' }
+            )
+            .select()
+            .single();
+
+        if (error) throw error;
+        res.status(201).json(data);  
     } catch (err) {
-        console.error(err.message);
-        res.status(500).send('Server Error');
+        console.error("Cart Route Error:", err.message);
+        res.status(500).json({ message: "Server Error" });
     }
 });
 
 // ROute to GET user's cart
-app.get('/api/cart/user/:username', async (req, res) => {
+app.get('/api/cart/user/:username', tenantDbMiddleware, async (req, res) => {
     try {
         const { username } = req.params;
-        const cartItems = await pool.query(
-            `SELECT 
-            cart.id, 
-            products.name, 
-            products.price, 
-            cart.quantity,
-            products.image_url
-            FROM cart
-            JOIN users ON cart.user_id = users.id
-            JOIN products ON cart.product_id = products.id
-            WHERE users.username = $1`,
-            [username]
-        );
-        res.json(cartItems.rows);
+        // Get user ID first
+        const { data: user, error: userError } = await supabase
+            .from('users')
+            .select('id')
+            .eq('username', username)
+            .single();
+
+        if (userError || !user) return res.status(404).json({ message: "User not found" });
+
+        // Fetch cart items joined with products
+        const { data: cartItems, error } = await supabase
+            .from('cart')
+            .select(`
+                id,
+                quantity,
+                products (
+                    name,
+                    price,
+                    image_url
+                )
+            `)
+            .eq('user_id', user.id);
+
+        if (error) throw error;
+
+        // Format to match expected frontend structure flattening the product join
+        const formattedCart = cartItems.map(item => ({
+            id: item.id,
+            name: item.products?.name,
+            price: item.products?.price,
+            quantity: item.quantity,
+            image_url: item.products?.image_url
+        }));
+
+        res.json(formattedCart);
     } catch (err) {
-        console.error(err.message);
-        res.status(500).send('Server Error');
+        console.error("Cart Route Error:", err.message);
+        res.status(500).json({ message: "Server Error" });
     }
 });
 
 // Route to get total number of items in the cart
-app.get('/api/cart/count/:username', async (req, res) => {
+app.get('/api/cart/count/:username',tenantDbMiddleware, async (req, res) => {
     try {
         const { username } = req.params;
-        const result = await pool.query(
-            `SELECT SUM(quantity) as total_count 
-            FROM cart
-            JOIN users ON cart.user_id = users.id
-            WHERE users.username = $1`,
-            [username]
-        );
-        // if cart is empty, SUM returns null so we return 0
-        const count = result.rows[0].total_count || 0;
-        res.json({ count: parseInt(count) });
+        const { data: user, error: userError } = await supabase
+            .from('users')
+            .select('id')
+            .eq('username', username)
+            .single();
+
+        if (userError || !user) return res.json({ count: 0 });
+
+        const { data: cartItems, error } = await supabase
+            .from('cart')
+            .select('quantity')
+            .eq('user_id', user.id);
+
+        if (error) throw error;
+
+        const totalCount = cartItems.reduce((acc, curr) => acc + curr.quantity, 0);
+        res.json({ count: totalCount });
     } catch (err) {
-        console.error(err.message);
-        res.status(500).send('Server Error');
+        console.error("Cart Route Error:", err.message);
+        res.status(500).json({ message: "Server Error" });
     }
 });
 
 // Route to DELETE 
-app.delete('/api/cart/:id', async (req, res) => {
+app.delete('/api/cart/:id',tenantDbMiddleware, async (req, res) => {
     try {
         const { id } = req.params;
-        await pool.query("DELETE FROM cart WHERE id = $1", [id]);
-        res.json({ message: "Item removed from cart"});
+        const { error } = await supabase
+            .from('cart')
+            .delete()
+            .eq('id', id);
+
+        if (error) throw error;
+        res.json({ message: "Item removed from cart" });
     } catch (err) {
-        console.error(err.message);
-        res.status(500).send("Server Error");
+        console.error("Cart Route Error:", err.message);
+        res.status(500).json({ message: "Server Error" });
     }
 });
 
 // Route to PUT quantity + / -
-app.put ('/api/cart/update-quantity/:id', async (req, res) => {
+app.put ('/api/cart/update-quantity/:id',tenantDbMiddleware, async (req, res) => {
     try {
         const { id } = req.params;
         const { change } = req.body;
         
-        // update quantity and ensure it never goes below 1
-        const result = await pool.query(
-            "UPDATE cart SET quantity = GREATEST(1, quantity + $1) WHERE id = $2 RETURNING *",
-            [change, id]
-        );
-        res.json(result.rows[0]);
+        // Fetch current quantity first to apply GREATEST logic safely
+        const { data: currentItem, error: fetchError } = await supabase
+            .from('cart')
+            .select('quantity')
+            .eq('id', id)
+            .single();
+
+        if (fetchError || !currentItem) return res.status(404).json({ message: "Cart item not found" });
+
+        const newQuantity = Math.max(1, currentItem.quantity + change);
+
+        const { data, error } = await supabase
+            .from('cart')
+            .update({ quantity: newQuantity })
+            .eq('id', id)
+            .select()
+            .single();
+
+        if (error) throw error;
+        res.json(data);
+        
     } catch (err) {
-        console.error (err.message);
-        res.status(500).send("Server Error");
+        console.error("Cart Route Error:", err.message);
+        res.status(500).json({ message: "Server Error" });
     }
 });
 
+
 // STK Push Route
-app.post('/api/stkpush', async (req, res) => {
-    const { phone, amount } = req.body;
+app.post('/api/stkpush',tenantDbMiddleware, async (req, res) => {
+    const { phone, amount, username } = req.body;
     const token = await getMpesaToken();
     const date = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14);
     const shortcode = "174379"; // Sandbox Till
@@ -266,7 +379,7 @@ app.post('/api/stkpush', async (req, res) => {
             "PartyA": phone, // e.g., 254712345678
             "PartyB": shortcode,
             "PhoneNumber": phone,
-            "CallBackURL": "https://unreleasing-ascogenous-bev.ngrok-free.dev/api/callback",
+            "CallBackURL": `https://unreleasing-ascogenous-bev.ngrok-free.dev/api/callback?store_slug=${req.storeSlug}`,
             "AccountReference": "RedStore",
             "TransactionDesc": "Payment for goods"
         }, {
@@ -274,15 +387,12 @@ app.post('/api/stkpush', async (req, res) => {
         });
 
         if (response.data.ResponseCode === "0") {
-            const { username } = req.body;
             const checkoutID = response.data.CheckoutRequestID;
 
-            await pool.query(
-                "INSERT INTO orders (username, checkout_request_id, amount, status) VALUES ($1, $2, $3, $4)",
-                [username, checkoutID, amount, 'pending']
-            );
+            await supabase
+                .from('orders')
+                .insert([{ username, checkout_request_id: checkoutID, amount, status: 'pending' }]);
         }
-
         res.status(200).json(response.data);
     } catch (err) {
         res.status(500).json(err.message);
@@ -291,69 +401,59 @@ app.post('/api/stkpush', async (req, res) => {
 })
 
 // STK Callback
-app.post('/api/callback', async (req, res) => {
+app.post('/api/callback',tenantDbMiddleware, async (req, res) => {
     const callbackData = req.body.Body.stkCallback;
     const resultCode = callbackData.ResultCode;
     const checkoutID = callbackData.CheckoutRequestID;
 
-    if (resultCode === 0) {
-        // resultcode 0 means success!
-        const amount = callbackData.CallbackMetadata.Item[0].Value;
-        const mpesaReceipt = callbackData.CallbackMetadata.Item[1].Value;
-        
-        try {
-            const orderRes = await pool.query("SELECT username FROM orders WHERE checkout_request_id = $1", [checkoutID]);
+    try {
+        if (resultCode === 0) {
+            const amount = callbackData.CallbackMetadata.Item[0].Value;
+            const mpesaReceipt = callbackData.CallbackMetadata.Item[1].Value;
+            
+            const { data: order, error: orderError } = await supabase
+                .from('orders')
+                .select('username')
+                .eq('checkout_request_id', checkoutID)
+                .single();
 
-            if (orderRes.rows.length > 0) {
-                const username = orderRes.rows[0].username;
+            if (order && !orderError) {
+                const username = order.username;
 
-                // update order status
-                await pool.query(
-                    "UPDATE orders SET status = 'paid', mpesa_receipt = $1 WHERE checkout_request_id = $2",
-                    [mpesaReceipt, checkoutID]
-                );
-                // clear user's cart
-                await pool.query(
-                    "DELETE FROM cart WHERE user_id = (SELECT id FROM users WHERE username = $1)",
-                    [username]
-                );
+                // Update order status to paid
+                await supabase
+                    .from('orders')
+                    .update({ status: 'paid', mpesa_receipt: mpesaReceipt })
+                    .eq('checkout_request_id', checkoutID);
+
+                // Get user ID and clear cart
+                const { data: user } = await supabase
+                    .from('users')
+                    .select('id')
+                    .eq('username', username)
+                    .single();
+
+                if (user) {
+                    await supabase
+                        .from('cart')
+                        .delete()
+                        .eq('user_id', user.id);
+                }
                 console.log(`Cart cleared and order marked as paid for ${username}`);
             }
-        } catch (dbErr) {
-            console.error("Database Update Error:", dbErr.message);
+        } else {
+            console.log(`Payment failed for Request: ${checkoutID}. Code: ${resultCode}`);
+            await supabase
+                .from('orders')
+                .update({ status: 'failed' })
+                .eq('checkout_request_id', checkoutID);
         }
-    } else {
-        console.log(`Payment failed for Request: ${checkoutID}. Code: ${resultCode}`);
-        await pool.query("UPDATE orders SET status = 'failed' WHERE checkout_request_id = $1", [checkoutID]);
+    } catch (dbErr) {
+        console.error("Database Callback Error:", dbErr.message);
     }
-    res.status(200).send("Success");
+    res.status(200).send("Success");  
+    
 })
-
-app.post('/api/intasend-webhook', async (req, res) => {
-    const { invoice_id, state, api_ref } = req.body;
-
-    // 'state' will be 'COMPLETE' for successful payments
-    if (state === 'COMPLETE') {
-        try {
-            // Use api_ref or other metadata to identify the user
-            // Example: Update your DB to mark order as paid
-            await pool.query(
-                "UPDATE orders SET status = 'paid' WHERE invoice_id = $1",
-                [invoice_id]
-            );
-            if (api_ref) {
-                await pool.query(
-                    "DELETE FROM cart WHERE user_id = (SELECT id FROM users WHERE username = $1)",
-                    [api_ref]
-                );
-                console.log(`IntaSend Success: Cart cleared for user ${api_ref}`);
-            }
-        } catch (err) {
-            console.error("Webhook DB Error:", err.message);
-        }
-    }
-    res.sendStatus(200); // Always tell IntaSend you received the message
-});
 
 
 app.listen(PORT, () => {
