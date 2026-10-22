@@ -379,7 +379,8 @@ app.post('/api/stkpush',tenantDbMiddleware, async (req, res) => {
             "PartyA": phone, // e.g., 254712345678
             "PartyB": shortcode,
             "PhoneNumber": phone,
-            "CallBackURL": `https://unreleasing-ascogenous-bev.ngrok-free.dev/api/callback?store_slug=${req.storeSlug}`,
+            /*"CallBackURL": `https://unreleasing-ascogenous-bev.ngrok-free.dev/api/callback?store_slug=${req.storeSlug}`,*/
+            "CallBackURL": `https://ecommerce-backend-hm0b.onrender.com/api/callback?store_slug=${req.storeSlug}`,
             "AccountReference": "RedStore",
             "TransactionDesc": "Payment for goods"
         }, {
