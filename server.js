@@ -56,7 +56,7 @@ const tenantDbMiddleware = async (req, res, next) => {
             .single();
 
         if (error || !data) {
-            return res.status(404).json({ message: "Store ecosystem not found" });
+            storeSlug = 'default-store'; // Fallback to default store if not found
         }
 
         req.storeSlug = storeSlug;
