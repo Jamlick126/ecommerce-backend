@@ -54,10 +54,22 @@ const tenantDbMiddleware = async (req, res, next) => {
             .select('store_slug')
             .eq('store_slug', storeSlug)
             .single();
-
+        
+        // If the custom slug isn't found in master_stores, force fallback to 'default-store'
         if (error || !data) {
-            storeSlug = 'default-store'; // Fallback to default store if not found
+            storeSlug = 'default-store';
+            const defaultCheck = await supabase
+                .from('master_stores')
+                .select('store_slug')
+                .eq('store_slug', storeSlug)
+                .single();
+            
+            if (defaultCheck.error) {
+                return res.status(404).json({ message: "Default store ecosystem not found" });
+            }
         }
+
+       
 
         req.storeSlug = storeSlug;
         next();
