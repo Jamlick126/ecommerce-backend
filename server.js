@@ -56,11 +56,14 @@ const productRoutes = require('./routes/products');
 const authRoutes = require('./routes/auth');
 const cartRoutes = require('./routes/cart');
 const paymentRoutes = require('./routes/payments');
+const adminRoutes = require('./routes/admin');
 
 app.use('/api', productRoutes); // Public & config routes
 app.use('/api', tenantDbMiddleware, authRoutes);
 app.use('/api', tenantDbMiddleware, cartRoutes);
 app.use('/api', tenantDbMiddleware, paymentRoutes);
+app.use('/api', tenantDbMiddleware, adminRoutes);
+
 
 app.listen(PORT, () => {
     console.log(`Server is running on http://localhost:${PORT}`);
