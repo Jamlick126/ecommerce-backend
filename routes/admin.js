@@ -43,7 +43,7 @@ router.put('/admin/orders/:id/status', verifyAdminToken, async (req, res) => {
         const { id } = req.params;
         const { status } = req.body; // e.g., 'paid' or 'failed'
 
-        if (!['pending', 'paid', 'failed'].includes(status)) {
+        if (!['pending', 'paid', 'failed', 'delivered'].includes(status)) {
             return res.status(400).json({ message: "Invalid status value provided" });
         }
 
